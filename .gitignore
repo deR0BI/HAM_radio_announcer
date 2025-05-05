@@ -1,0 +1,36 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.so
+
+# Virtual environment
+.venv/
+venv/
+env/
+ENV/
+
+# IDE/editor
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Databases, caches, exports
+*.sqlite3
+*.db
+*.db-journal
+
+# RDA data dumps / generated JSON
+RDA_list_2025.csv
+rda_codes.json
+
+# dotenv, credentials
+.env
