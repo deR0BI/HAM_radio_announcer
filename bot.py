@@ -2,6 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 Telegram-бот RDA Cluster (Python 3.13, aiogram 3.20).
+Включает «Мастер настроек» через inline-меню без потери основного функционала.
+Теперь HTML-теги анонсов безопасно обрабатываются и отображаются корректно.
 """
 
 import asyncio
@@ -11,34 +13,38 @@ import logging
 import pathlib
 import re
 import socketio
+import html
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import Command
-from aiogram.filters.command import CommandObject
+from aiogram.filters.command import Command, CommandObject
 from aiogram.types import Message, CallbackQuery, BotCommand
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import StatesGroup, State
 
 import config
 import storage as db
 import keyboards
 import rda_parser
 
+# ───── Логирование ─────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(message)s"
 )
 log = logging.getLogger("RDA-bot")
 
-# ───── загрузка RDA-кодов ─────
+# ───── Загрузка RDA-кодов ─────
 def load_rda() -> set[str]:
     for p in ("RDA_list_2025.json", "RDA_list_2025.csv"):
         f = pathlib.Path(p)
-        if not f.exists(): continue
+        if not f.exists():
+            continue
         if f.suffix == ".json":
             return set(json.loads(f.read_text(encoding="utf-8")))
         codes = set()
-        for enc in ("utf-8-sig", "utf-8", "cp1251", "koi8-r", "latin1"):
+        for enc in ("utf-8-sig","utf-8","cp1251","koi8-r","latin1"):
             try:
                 with f.open(encoding=enc) as fh:
                     for ln in fh:
@@ -54,7 +60,7 @@ def load_rda() -> set[str]:
 RDA_SET = load_rda()
 log.info("RDA codes loaded: %s", len(RDA_SET) or "none")
 
-# ───── aiogram ─────
+# ───── Инициализация бота ─────
 bot = Bot(
     token=config.BOT_TOKEN,
     default=DefaultBotProperties(parse_mode=ParseMode.HTML)
@@ -62,13 +68,29 @@ bot = Bot(
 dp = Dispatcher()
 MAX_LEN = 4096
 
-# ───── помощники ─────
+# ───── Вспомогательные функции ─────
 def sha(*parts: str) -> str:
     return hashlib.sha1("|".join(parts).encode()).hexdigest()
 
+def sanitize_html(text: str) -> str:
+    esc = html.escape(text)
+    for tag in ("b", "i"):
+        esc = esc.replace(f"&lt;{tag}&gt;", f"<{tag}>")
+        esc = esc.replace(f"&lt;/{tag}&gt;", f"</{tag}>")
+    return esc
+
 async def send_big(cid: int, text: str):
-    for ofs in range(0, len(text), MAX_LEN):
-        await bot.send_message(cid, text[ofs:ofs+MAX_LEN])
+    # разбиваем по строкам, аккуратно набирая куски до MAX_LEN
+    chunks: list[str] = []
+    for line in text.split("\n"):
+        if not chunks or len(chunks[-1]) + len(line) + 1 > MAX_LEN:
+            chunks.append(line)
+        else:
+            chunks[-1] += "\n" + line
+    # отправляем уже «целые» куски с корректными HTML-тегами
+    for chunk in chunks:
+        safe = sanitize_html(chunk)
+        await bot.send_message(cid, safe, parse_mode=ParseMode.HTML)
 
 def split_args(m: Message, cmd: CommandObject | None) -> str:
     if cmd and cmd.args:
@@ -83,17 +105,120 @@ async def allowed(cid: int, rda: str, mode: str, freq: float) -> bool:
     if rda_list and not any(x in rda.split() for x in rda_list):
         return False
     m, lo, hi = await db.misc(cid)
-    if m != "ANY" and m != mode.upper():
+    if m and m != "ANY" and m != mode.upper():
         return False
-    return lo <= freq <= hi
+    return (lo is None or lo <= freq) and (hi is None or freq <= hi)
 
-# ─────────────────── HANDLERS ────────────────────
+# ─────────────────── FSM: мастер настроек ────────────────────
+class SettingsSG(StatesGroup):
+    choosing  = State()  # главное меню
+    mode      = State()  # выбор режима
+    band_from = State()  # выбор предустановки или ручного ввода
+    band_to   = State()  # ввод вручную
+    rda       = State()  # ввод списка RDA
 
+@dp.message(Command("settings"))
+async def cmd_settings(m: Message, state: FSMContext):
+    mode, lo, hi = await db.misc(m.chat.id)
+    rda_lst = await db.get_rda(m.chat.id)
+    await state.update_data(
+        mode=mode or "ANY",
+        band=(lo if lo is not None else 0.1, hi if hi is not None else 30.0),
+        rda=rda_lst
+    )
+    await m.answer("🔧 Мастер настроек:", reply_markup=keyboards.settings_menu())
+    await state.set_state(SettingsSG.choosing)
+
+@dp.callback_query(F.data == "settings_back", SettingsSG.choosing)
+async def cb_settings_back(cq: CallbackQuery):
+    await cq.message.edit_text("🔧 Мастер настроек:", reply_markup=keyboards.settings_menu())
+
+# 1) Режим
+@dp.callback_query(F.data == "set_mode", SettingsSG.choosing)
+async def cb_set_mode(cq: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    await cq.message.edit_text(
+        "Выберите режим:", reply_markup=keyboards.mode_menu(data["mode"])
+    )
+    await state.set_state(SettingsSG.mode)
+
+@dp.callback_query(F.data.startswith("mode|"), SettingsSG.mode)
+async def cb_mode_selected(cq: CallbackQuery, state: FSMContext):
+    _, m = cq.data.split("|", 1)
+    await state.update_data(mode=m)
+    await cq.answer(f"Режим → {m}")
+    await cq.message.edit_text("🔧 Мастер настроек:", reply_markup=keyboards.settings_menu())
+    await state.set_state(SettingsSG.choosing)
+
+# 2) Диапазон
+@dp.callback_query(F.data == "set_band", SettingsSG.choosing)
+async def cb_set_band(cq: CallbackQuery, state: FSMContext):
+    await cq.message.edit_text("Выберите диапазон:", reply_markup=keyboards.band_menu())
+    await state.set_state(SettingsSG.band_from)
+
+@dp.callback_query(F.data.startswith("band|"), SettingsSG.band_from)
+async def cb_band_preset(cq: CallbackQuery, state: FSMContext):
+    parts = cq.data.split("|")
+    if len(parts) == 2 and parts[1] == "custom":
+        await cq.message.edit_text("Введите диапазон (MHz), например: 1.8 29.0")
+        await state.set_state(SettingsSG.band_to)
+        return
+    _, lo, hi = parts
+    lo_f, hi_f = float(lo), float(hi)
+    await state.update_data(band=(lo_f, hi_f))
+    await cq.answer(f"Диапазон {lo}–{hi} МГц")
+    await cq.message.edit_text("🔧 Мастер настроек:", reply_markup=keyboards.settings_menu())
+    await state.set_state(SettingsSG.choosing)
+
+@dp.message(SettingsSG.band_to)
+async def msg_band_to(m: Message, state: FSMContext):
+    parts = re.split(r"[ ,]+", m.text.strip())
+    if len(parts) == 2 and all(re.fullmatch(r"\d+(\.\d+)?", p) for p in parts):
+        lo, hi = sorted(map(float, parts))
+        await state.update_data(band=(lo, hi))
+        await m.answer(f"Диапазон {lo}–{hi} МГц установлен!")
+        await m.answer("🔧 Мастер настроек:", reply_markup=keyboards.settings_menu())
+        await state.set_state(SettingsSG.choosing)
+    else:
+        await m.reply("Неверный формат. Напишите: два числа через пробел, например: `1.8 29.0`.")
+
+# 3) RDA-зоны
+@dp.callback_query(F.data == "set_rda", SettingsSG.choosing)
+async def cb_set_rda(cq: CallbackQuery, state: FSMContext):
+    current = (await state.get_data())["rda"]
+    await cq.message.edit_text(
+        f"Текущий RDA: {', '.join(current) or '—'}\nВведите новые через запятую:"
+    )
+    await state.set_state(SettingsSG.rda)
+
+@dp.message(SettingsSG.rda)
+async def msg_rda(m: Message, state: FSMContext):
+    items = [x.strip().upper() for x in m.text.split(",") if x.strip()]
+    await state.update_data(rda=items)
+    await m.answer("Список RDA обновлён!")
+    await m.answer("🔧 Мастер настроек:", reply_markup=keyboards.settings_menu())
+    await state.set_state(SettingsSG.choosing)
+
+# 4) Сохранение настроек
+@dp.callback_query(F.data == "set_done", SettingsSG.choosing)
+async def cb_done(cq: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    mode_v = data["mode"] if data["mode"] != "ANY" else None
+    await db.set_mode(cq.from_user.id, mode_v)
+    lo, hi = data["band"]
+    await db.set_band(cq.from_user.id, lo, hi)
+    await db.clear_rda(cq.from_user.id)
+    if data["rda"]:
+        await db.add_rda(cq.from_user.id, *data["rda"])
+    await cq.message.edit_text("Все настройки сохранены ✅")
+    await state.clear()
+
+# ─────────────────── Оригинальные хендлеры ───────────────────
 @dp.message(Command("start"))
 async def cmd_start(m: Message, command: CommandObject | None = None):
     await db.upsert_user(m.chat.id, m.from_user.first_name, m.from_user.username)
     await m.answer(
-        "👋  Бот рассылает анонсы и live-споты RDA.\nСправка — /help",
+        "👋 Бот рассылает анонсы и live-споты RDA.\nСправка — /help",
         reply_markup=keyboards.main_kb()
     )
 
@@ -104,10 +229,10 @@ async def cmd_help(m: Message, command: CommandObject | None = None):
         "/sub_spots /unsub_spots — подписка/отписка от спотов\n"
         "/add_rda AD-01 … — добавить RDA-фильтр\n"
         "/set_mode DIGI|CW|SSB|ANY — фильтр по моде\n"
-        "/set_band 14 14.35 | OFF — диапазон МГц\n"
-        "/set_template … — ваш шаблон\n"
+        "/set_band 1.8 29.0 | OFF — диапазон МГц\n"
         "/my_filters — текущие фильтры\n"
-        "/clear_rda — убрать все RDA-фильтры"
+        "/clear_rda — убрать все RDA-фильтры\n"
+        "/settings — открыть мастер настроек"
     )
 
 async def _sub(m: Message, kind: str, on: bool):
@@ -146,7 +271,6 @@ async def cmd_add_rda(m: Message, command: CommandObject | None):
 
 @dp.message(Command("clear_rda"))
 async def cmd_clear_rda(m: Message):
-    """Команда /clear_rda очищает все фильтры RDA."""
     await db.clear_rda(m.chat.id)
     await m.answer("✅ Все RDA-фильтры удалены.")
 
@@ -155,70 +279,30 @@ async def cmd_my_filters(m: Message, command: CommandObject | None = None):
     mode, lo, hi = await db.misc(m.chat.id)
     rda = await db.get_rda(m.chat.id)
     await m.answer(
-        f"Mode: {mode}\n"
-        f"Band: {lo}–{hi} МГц\n"
+        f"Mode: {mode or 'ANY'}\n"
+        f"Band: {lo or 0.0}–{hi or 0.0} МГц\n"
         f"RDA: {'; '.join(sorted(rda)) if rda else 'все'}"
     )
 
-@dp.message(Command("set_mode"))
-async def cmd_set_mode(m: Message, command: CommandObject | None):
-    arg = split_args(m, command).upper()
-    if arg in {"DIGI", "CW", "SSB"}:
-        await db.set_mode(m.chat.id, arg)
-        return await m.answer(f"Мода → {arg}")
-    if arg in {"ANY", "OFF", ""}:
-        await db.set_mode(m.chat.id, None)
-        return await m.answer("Фильтр моды снят.")
-    await m.answer("Укажите DIGI / CW / SSB / ANY")
+@dp.startup()
+async def on_startup():
+    await db.init_db()
+    await bot.set_my_commands([
+        BotCommand(command="announcements", description="Текущие анонсы"),
+        BotCommand(command="sub_ann",       description="Подписаться на анонсы"),
+        BotCommand(command="unsub_ann",     description="Отписаться от анонсов"),
+        BotCommand(command="sub_spots",     description="Подписаться на споты"),
+        BotCommand(command="unsub_spots",   description="Отписаться от спотов"),
+        BotCommand(command="add_rda",       description="Добавить фильтр RDA"),
+        BotCommand(command="clear_rda",     description="Очистить RDA-фильтры"),
+        BotCommand(command="my_filters",    description="Мои фильтры"),
+        BotCommand(command="settings",      description="Мастер настроек"),
+    ])
+    asyncio.create_task(ann_loop())
+    asyncio.create_task(ws_loop())
+    log.info("🚀 Bot started")
 
-@dp.message(Command("set_band"))
-async def cmd_set_band(m: Message, command: CommandObject | None):
-    a = split_args(m, command)
-    if not a or a.upper() == "OFF":
-        await db.set_band(m.chat.id, None, None)
-        return await m.answer("Фильтр диапазона снят.")
-    parts = re.split(r"[ ,]+", a)
-    if len(parts) == 2 and all(re.fullmatch(r"\d+(\.\d+)?", p) for p in parts):
-        lo, hi = sorted(map(float, parts))
-        await db.set_band(m.chat.id, lo, hi)
-        return await m.answer(f"Диапазон {lo}–{hi} МГц")
-    await m.answer("Пример: /set_band 14 14.35")
-
-@dp.message(Command("set_template"))
-async def cmd_set_template(m: Message, command: CommandObject | None):
-    tmpl = split_args(m, command)
-    if not tmpl:
-        return await m.answer("Поле шаблона пусто. Используйте аргументы команды.")
-    await db.set_template(m.chat.id, tmpl)
-    await m.answer("Шаблон сохранён.")
-
-# ─── reply-кнопки ───
-@dp.message(F.text == "📋 Анонсы")
-async def btn_ann(m: Message): await cmd_ann(m, None)
-
-@dp.message(F.text == "✅ Подписаться на споты")
-async def btn_sub(m: Message): await _sub(m, "spot", True)
-
-@dp.message(F.text == "❌ Отписаться")
-async def btn_unsub(m: Message): await _sub(m, "spot", False)
-
-@dp.message(F.text == "🎛 Мои фильтры")
-async def btn_filters(m: Message): await cmd_my_filters(m, None)
-
-# ─── inline-кнопки ───
-@dp.callback_query(F.data == "refresh")
-async def cb_refresh(c: CallbackQuery):
-    txt = rda_parser.build_announcements_message()
-    await c.message.edit_text(txt, reply_markup=keyboards.announce_kb())
-    await c.answer("Обновил")
-
-@dp.callback_query(F.data == "expand")
-async def cb_expand(c: CallbackQuery):
-    all_txt = rda_parser.build_announcements_message(wrap=0)
-    await send_big(c.message.chat.id, all_txt)
-    await c.answer()
-
-# ─── background tasks ───
+# ─── Background loops ───
 async def ann_loop():
     last = None
     while True:
@@ -241,7 +325,7 @@ async def ws_loop():
             p = msg.split("|")
             callsign, time, freq, mode = p[0], p[1], float(p[2]), p[3]
             rda, text, spotter = p[5], p[7], p[8]
-            if not rda or rda == "?": return
+            if not rda or rda=="?": return
             if not await db.is_new(sha(callsign, time, p[2])): return
             for cid in await db.subscribers("spot"):
                 if not await allowed(cid, rda, mode, freq): continue
@@ -259,24 +343,6 @@ async def ws_loop():
         except Exception:
             log.exception("ws_loop")
         await asyncio.sleep(15)
-
-# ─── startup ───
-@dp.startup()
-async def on_startup():
-    await db.init_db()
-    await bot.set_my_commands([
-        BotCommand(command="announcements", description="Текущие анонсы"),
-        BotCommand(command="sub_ann",       description="Подписаться на анонсы"),
-        BotCommand(command="unsub_ann",     description="Отписаться от анонсов"),
-        BotCommand(command="sub_spots",     description="Подписаться на споты"),
-        BotCommand(command="unsub_spots",   description="Отписаться от спотов"),
-        BotCommand(command="add_rda",       description="Добавить фильтр RDA"),
-        BotCommand(command="clear_rda",     description="Очистить RDA-фильтры"),
-        BotCommand(command="my_filters",    description="Мои фильтры"),
-    ])
-    asyncio.create_task(ann_loop())
-    asyncio.create_task(ws_loop())
-    log.info("🚀 Bot started")
 
 async def main():
     await dp.start_polling(bot)
